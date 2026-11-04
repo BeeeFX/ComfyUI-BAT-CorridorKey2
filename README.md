@@ -15,7 +15,7 @@ and so on, their official plugin is at [corridorkey.com](https://corridorkey.com
 |---|---|
 | **🦇 CorridorKey 2 Load Model** | Loads the model (1.27B parameters, about 5 GB). It waits in system RAM and only goes to the GPU while keying. |
 | **🦇 CorridorKey 2** | The keyer. Inputs: `images`, an optional `hint` mask and optional `advanced` settings. Outputs: `foreground`, `alpha`, `preview`. |
-| **🦇 CorridorKey 2 Advanced Params** | Optional. Window size, low-VRAM mode, hint carry, internal resolution, a VRAM cap, temp folder. If you don't connect it, the key node uses the same defaults. |
+| **🦇 CorridorKey 2 Advanced Params** | Optional. Time awareness (window), low-VRAM mode, a VRAM cap, internal resolution, hint carry. If you don't connect it, the key node uses the same defaults. |
 
 ### 🦇 CorridorKey 2
 
@@ -31,7 +31,7 @@ and so on, their official plugin is at [corridorkey.com](https://corridorkey.com
 - **despill_strength**: 0 = the model's raw colour, 1 = full despill. Default 0.5.
 - **hint** (MASK, optional, white = subject). With no hint the model picks the subject
   itself, which is fine for simple shots but less reliable when there are several
-  possible subjects.
+  possible subjects. The hint settings below only show while a mask is connected.
 - **hint_mode**:
   - `all frames`: one mask per frame, such as a roto pass or an automatic track (SeC).
   - `single frame`: one hint on `hint_frame`, which the model carries through the shot.
@@ -41,11 +41,31 @@ and so on, their official plugin is at [corridorkey.com](https://corridorkey.com
   keyed backwards and forwards from that frame, so a matte drawn on a clean frame in the
   middle of the shot guides all of it.
 
+- **preview**: key only a few frames around **preview_frame** and show the result
+  (composite and alpha) on the node. Combined with the queue's **Run (On Change)** mode,
+  every tweak re-keys just that window in a few seconds. The preview frame is keyed with
+  8 neighbours so it looks like the full key. A single-frame hint elsewhere in the clip
+  pulls the frames in between into the preview too, because that's the only way the hint
+  reaches it. While preview is on, the outputs are that one frame: turn it off for the
+  full render.
+
 Outputs:
 
 - `foreground`: straight (not premultiplied), despilled colour;
 - `alpha`: the matte, 0 to 1;
 - `preview`: the result over a checkerboard, for viewing.
+
+### 🦇 CorridorKey 2 Advanced Params
+
+- **window_frames**: time awareness. 0 = the largest window that fits the free VRAM (up
+  to 80 frames), 1 = every frame on its own.
+- **low_vram**: `auto` uses it only when the window wouldn't fit otherwise.
+- **vram_limit_gb**: plan for at most this much VRAM. 0 = everything free.
+- **internal_resolution**: full, 3/4, 1/2 or 1/4.
+- **carry_hint**, **carry_hint_quality**: the model's own matte carried between windows,
+  and how far to trust it.
+
+Low-VRAM mode spills its temporary files to the system temp folder; set `TMPDIR` to move it.
 
 ### Coming from the CorridorKey app
 
@@ -88,8 +108,7 @@ cd ComfyUI/custom_nodes
 git clone https://github.com/BeeeFX/ComfyUI-BAT-CorridorKey2
 ```
 
-Then restart ComfyUI. On first use, with `auto_download` on,
-the loader fetches:
+Then restart ComfyUI. On first use, the loader fetches:
 
 1. **The CorridorKey 2.0 runtime**, pinned to an exact upstream commit, from GitHub into
    this pack's `upstream/` folder. Every file is checked against `ck2/UPSTREAM_MANIFEST.json`

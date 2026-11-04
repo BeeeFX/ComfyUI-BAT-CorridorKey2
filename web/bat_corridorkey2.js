@@ -1,10 +1,13 @@
 /**
- * 🦇 CorridorKey 2 — hint_frame only shows when hint_mode is "single frame".
+ * 🦇 CorridorKey 2 — show only the controls that do something.
  *
- * Hidden rows keep serialising, so a workflow saved in "all frames" still
- * remembers the frame you last picked. Same hide approach as BAT-NodePack's
- * bat_batch_format.js (type/computeSize/draw/hidden), which drops the row from
- * the layout instead of blanking it.
+ *   hint_quality, hint_mode  only while a mask is connected to `hint`
+ *   hint_frame               ... and hint_mode is "single frame"
+ *   preview_frame            only while `preview` is on
+ *
+ * Hidden rows keep serialising, so values survive being hidden. Same hide
+ * approach as BAT-NodePack's bat_batch_format.js (type/computeSize/draw/hidden),
+ * which drops the row from the layout instead of blanking it.
  */
 
 import { app } from "/scripts/app.js";
@@ -32,11 +35,16 @@ function setHidden(widget, hidden) {
 }
 
 function syncVisibility(node) {
-    const mode = node.widgets?.find(w => w.name === "hint_mode");
-    const frame = node.widgets?.find(w => w.name === "hint_frame");
-    if (!mode || !frame) return;
-    setHidden(frame, mode.value !== "single frame");
-    // Re-fit, or the node keeps a dead band where the row used to be.
+    const get = name => node.widgets?.find(w => w.name === name);
+    const mode = get("hint_mode");
+    const preview = get("preview");
+    if (!mode || !preview) return;
+    const hinted = node.inputs?.find(i => i.name === "hint")?.link != null;
+    setHidden(get("hint_quality"), !hinted);
+    setHidden(mode, !hinted);
+    setHidden(get("hint_frame"), !hinted || mode.value !== "single frame");
+    setHidden(get("preview_frame"), !preview.value);
+    // Re-fit, or the node keeps a dead band where the rows used to be.
     const min = node.computeSize?.();
     if (min) node.setSize([Math.max(node.size[0], min[0]), min[1]]);
     node.setDirtyCanvas?.(true, true);
@@ -50,11 +58,12 @@ app.registerExtension({
         const onNodeCreated = nodeType.prototype.onNodeCreated;
         nodeType.prototype.onNodeCreated = function (...args) {
             const r = onNodeCreated?.apply(this, args);
-            const mode = this.widgets?.find(w => w.name === "hint_mode");
-            if (mode) {
-                const orig = mode.callback;
-                const node = this;
-                mode.callback = function (...cbArgs) {
+            const node = this;
+            for (const name of ["hint_mode", "preview"]) {
+                const widget = this.widgets?.find(w => w.name === name);
+                if (!widget) continue;
+                const orig = widget.callback;
+                widget.callback = function (...cbArgs) {
                     const out = orig?.apply(this, cbArgs);
                     syncVisibility(node);
                     return out;
@@ -64,11 +73,17 @@ app.registerExtension({
             return r;
         };
 
-        // configure() restores widget values after onNodeCreated, so a workflow
-        // saved in "single frame" would otherwise load with hint_frame hidden.
+        // configure() restores widget values and input links after onNodeCreated.
         const onConfigure = nodeType.prototype.onConfigure;
         nodeType.prototype.onConfigure = function (...args) {
             const r = onConfigure?.apply(this, args);
+            syncVisibility(this);
+            return r;
+        };
+
+        const onConnectionsChange = nodeType.prototype.onConnectionsChange;
+        nodeType.prototype.onConnectionsChange = function (...args) {
+            const r = onConnectionsChange?.apply(this, args);
             syncVisibility(this);
             return r;
         };

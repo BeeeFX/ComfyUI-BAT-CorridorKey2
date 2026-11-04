@@ -100,18 +100,6 @@ def test_internal_resolution():
         check("full resolution skips the resize", driver._upscale_to_output(y, full) is y)
 
 
-def test_linear_adjust_follows_video_path():
-    rng = np.random.default_rng(1)
-    h, w = 64, 64
-    bgr = rng.integers(0, 256, (h, w, 3), dtype=np.uint8)
-    s = dict(driver.DEFAULTS, linear_brightness=1.7, linear_contrast=0.8)
-    meta = driver.build_meta(1, h, w, s)
-    ref = vio.preprocess_video_frame_views(bgr, meta, need_model=True)
-    img = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-    ours = driver.FrameSource(torch.from_numpy(img[None]), meta, False, [0]).views(0)
-    check("brightness/contrast == upstream video-path views", all(same(o, r) for o, r in zip(ours, ref)))
-
-
 def test_despill():
     x = torch.rand(2, 3, 8, 8) * 1.5
     g = driver.despill(x, 0.7, "green")
@@ -168,16 +156,21 @@ def test_nodes():
     for cls in (nodes.CorridorKey2, nodes.CorridorKey2AdvancedParams, nodes.CorridorKey2LoadModel):
         spec = cls.INPUT_TYPES()
         names = list(spec["required"]) + list(spec.get("optional", {}))
-        params = list(inspect.signature(getattr(cls, cls.FUNCTION)).parameters)[1:]
-        accepts_kw = any(p.kind == p.VAR_KEYWORD for p in
-                         inspect.signature(getattr(cls, cls.FUNCTION)).parameters.values())
+        sig = inspect.signature(getattr(cls, cls.FUNCTION)).parameters.values()
+        params = [p.name for p in sig if p.kind != p.VAR_KEYWORD][1:]
+        accepts_kw = any(p.kind == p.VAR_KEYWORD for p in sig)
         check(f"{cls.__name__} inputs match its function",
-              accepts_kw and set(params[:2]) <= set(names) or params == names, f"{names} vs {params}")
+              set(params) <= set(names) if accepts_kw else params == names, f"{names} vs {params}")
     check("key node widget order is the saved-workflow contract",
           [k for k, v in nodes.CorridorKey2.INPUT_TYPES()["required"].items()
            if isinstance(v[0], list) or v[0] in ("FLOAT", "INT", "BOOLEAN", "STRING")]
           == ["input_colorspace", "screen", "hint_quality", "despill_strength",
-              "hint_mode", "hint_frame"])
+              "hint_mode", "hint_frame", "preview", "preview_frame"])
+    check("advanced node is down to the six settings",
+          list(nodes.CorridorKey2AdvancedParams.INPUT_TYPES()["required"])
+          == ["window_frames", "low_vram", "vram_limit_gb", "internal_resolution",
+              "carry_hint", "carry_hint_quality"])
+    check("loader has no widgets", nodes.CorridorKey2LoadModel.INPUT_TYPES() == {"required": {}})
 
 
 def test_plan_passes():
@@ -222,6 +215,37 @@ def test_select_hint():
             check(f"{name} is rejected", False)
         except ValueError as e:
             check(f"{name} is rejected", "hint" in str(e))
+
+
+def test_preview_range():
+    pr = nodes.preview_range
+    check("preview window is centred", pr(100, 50) == (50, 46, 55))
+    check("preview window slides in at the start", pr(100, 1) == (1, 0, 9))
+    check("preview window slides in at the end", pr(100, 99) == (99, 91, 100))
+    check("short clip previews all of it", pr(5, 3) == (3, 0, 5))
+    check("preview_frame clamped to the clip", pr(20, 500) == (19, 11, 20))
+    check("a single hint before the window stretches it back", pr(100, 50, 10) == (50, 10, 55))
+    check("a single hint after the window stretches it forward", pr(100, 50, 80) == (50, 46, 81))
+    check("a single hint inside the window changes nothing", pr(100, 50, 48) == (50, 46, 55))
+
+
+def test_preview_images():
+    import folder_paths
+    old = folder_paths.get_temp_directory()
+    with tempfile.TemporaryDirectory() as d:
+        folder_paths.set_temp_directory(d)
+        try:
+            comp = torch.rand(30, 40, 3)
+            alpha = torch.rand(30, 40)
+            ui = nodes.save_temp_previews([comp, alpha[..., None].expand(-1, -1, 3)])
+            files = [os.path.join(d, u["subfolder"], u["filename"]) for u in ui]
+            back = [np.array(__import__("PIL.Image", fromlist=["Image"]).open(f)) for f in files]
+            check("preview writes one temp PNG per image", len(ui) == 2 and all(os.path.isfile(f) for f in files)
+                  and all(u["type"] == "temp" for u in ui))
+            check("preview PNG holds the frame (8-bit)",
+                  back[0].shape == (30, 40, 3) and np.abs(back[0] / 255.0 - comp.numpy()).max() <= 0.5 / 255 + 1e-6)
+        finally:
+            folder_paths.set_temp_directory(old)
 
 
 def test_hint_validation():

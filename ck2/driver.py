@@ -16,7 +16,7 @@ What differs from upstream, on purpose:
   upstream resizes a full hint video (Lanczos).
 * Normal-mode RVM features stay in RAM instead of a temp memmap (they are small).
   Low-VRAM mode still spills the foundation features and the stage-1 baton to
-  ``temp_dir`` exactly as upstream does.
+  the system temp directory (``TMPDIR``) exactly as upstream does.
 * The low-VRAM chunk sizes upstream writes onto the model are reset on every
   run, because here the model is cached between runs.
 * Blue-screen despill, mirroring upstream's green formula (``screen="blue"``).
@@ -46,25 +46,24 @@ SHAPE_QUANTUM = 128
 # of truth: the node reads these for its widget defaults.
 DEFAULTS = {
     "hann_chunk": 0,                 # 0 = auto from free VRAM
-    "hann_stride": 0,                # 0 = half the chunk
     "low_vram": "auto",              # auto / on / off (not bit-exact vs off: bf16 path)
+    "vram_limit_gb": 0.0,            # 0 = all free VRAM
+    "internal_resolution": "full",   # see SCALES
     "carry_hint": True,
     "carry_hint_quality": 0.95,
-    "stage2_batch": 1,
-    "low_vram_foundation_chunk": 4,
-    "low_vram_mlp_chunk_tokens": 65536,
+}
+
+# Upstream's own defaults for the low-VRAM chunking ("use the defaults unless you
+# are actively tuning memory"), the stage-2 batch (1 measured no slower) and the
+# window stride (half the window). Fixed, not exposed.
+LOW_VRAM_CHUNKING = {
     "low_vram_enc_frame_chunk": 1,
+    "low_vram_mlp_chunk_tokens": 65536,
     "low_vram_swin_window_batch": 16,
     "low_vram_full_attn_query_chunk_tokens": 2048,
-    "linear_brightness": 1.0,
-    "linear_contrast": 1.0,
-    "linear_contrast_pivot": 0.18,
-    "temp_dir": "",                  # "" = ComfyUI temp dir
-    "keep_model_on_gpu": False,
-    "free_comfy_vram": True,
-    "internal_resolution": "full",   # see SCALES
-    "vram_limit_gb": 0.0,            # 0 = all free VRAM
 }
+LOW_VRAM_FOUNDATION_CHUNK = 4
+STAGE2_BATCH = 1
 
 SCALES = {"full": 1.0, "3/4": 0.75, "1/2": 0.5, "1/4": 0.25}
 
@@ -95,9 +94,6 @@ def build_meta(num_frames, h, w, settings):
         "model_scale": scale,
         "shape_hw": (h_out, w_out),
         "pad": (pad_l, w_out - w_m - pad_l, pad_t, h_out - h_m - pad_t),
-        "linear_brightness": float(settings["linear_brightness"]),
-        "linear_contrast": float(settings["linear_contrast"]),
-        "linear_contrast_pivot": float(settings["linear_contrast_pivot"]),
     }
 
 
@@ -135,7 +131,7 @@ def pick_profile(shape_hw, num_frames, budget_gb, chunk=0, low_vram="auto"):
     return c, max(1, c // 2), lv, fits(c, lv)[1]
 
 
-def configure_chunking(model, settings, low_vram):
+def configure_chunking(model, low_vram):
     """Upstream's configure_low_vram_inference, plus the reset it never needs.
 
     The attributes it sets persist on the modules, and 0 means "off". A cached
@@ -143,10 +139,7 @@ def configure_chunking(model, settings, low_vram):
     """
     rt, _, _ = _mods()
     if low_vram:
-        cfg = type("Cfg", (), {k: settings[k] for k in (
-            "low_vram_enc_frame_chunk", "low_vram_mlp_chunk_tokens",
-            "low_vram_swin_window_batch", "low_vram_full_attn_query_chunk_tokens")})
-        rt.configure_low_vram_inference(model, cfg)
+        rt.configure_low_vram_inference(model, type("Cfg", (), LOW_VRAM_CHUNKING))
         return
     model.stage1.low_vram_enc_frame_chunk = 0
     for module in model.modules():
@@ -170,8 +163,7 @@ class FrameSource:
 
     sRGB input follows the frame-directory path (display clipped to [0, 1],
     decoded to linear with the package gamma). Linear input follows the
-    ``--frame_dir_linear`` path. The optional brightness/contrast adjustment
-    follows the video path, which is the only one upstream applies it on.
+    ``--frame_dir_linear`` path.
     """
 
     def __init__(self, images, meta, linear_input, frame_ids):
@@ -204,18 +196,10 @@ class FrameSource:
             linear = vio.resize_hwc_lanczos(linear, model_hw)
         review = torch.from_numpy(
             self._pad(np.clip(display, 0.0, 1.0)).transpose(2, 0, 1)).to(torch.bfloat16)
-        linear_model = linear
-        foundation = review
-        if vio.has_linear_adjust(self.meta):
-            linear_model = vio.apply_linear_adjust(linear, self.meta)
-            foundation = torch.from_numpy(
-                self._pad(cu.linear_to_vfm_sdr(linear_model)).transpose(2, 0, 1)
-            ).to(torch.bfloat16)
         if not need_model:
-            return None, foundation, review
-        model = cu.linear_to_asinh(self._pad(linear_model))
-        return (torch.from_numpy(model.transpose(2, 0, 1)).to(torch.bfloat16),
-                foundation, review)
+            return None, review, review
+        model = cu.linear_to_asinh(self._pad(linear))
+        return torch.from_numpy(model.transpose(2, 0, 1)).to(torch.bfloat16), review, review
 
     def window(self, t0, t1):
         """Same contract and cache eviction as upstream's Sequential*WindowReader."""
@@ -303,7 +287,7 @@ def render(logits, meta, *, linear_output, despill_strength, screen, checker_lin
     rt, _, cu = _mods()
     out = _upscale_to_output(rt._crop_native_torch(logits[:, 0:4].float(), meta), meta)
     alpha = out[:, 0:1].clamp(0.0, 1.0)
-    fg_lin = rt._linear_adjust_inverse_torch(cu.asinh_to_linear(out[:, 1:4]), meta)
+    fg_lin = cu.asinh_to_linear(out[:, 1:4])
     if linear_output:
         fg = despill(fg_lin, despill_strength, screen)
         comp_lin = fg * alpha + checker_lin * (1.0 - alpha)
@@ -526,13 +510,13 @@ def _stage1_stream(model, src, hints, hint_mode, meta, *, chunk, stride, hint_qu
     return len(starts)
 
 
-def count_steps(num_frames, chunk, stride, low_vram, settings):
+def count_steps(num_frames, chunk, stride, low_vram):
     _, vio, _ = _mods()
     n = math.ceil(num_frames / max(1, min(chunk, 8)))                      # RVM prepass
     n += len(vio.window_starts(num_frames, chunk, stride))                 # stage 1
     if low_vram:
-        n += math.ceil(num_frames / max(1, int(settings["low_vram_foundation_chunk"])))
-        n += math.ceil(num_frames / max(1, int(settings["stage2_batch"])))
+        n += math.ceil(num_frames / LOW_VRAM_FOUNDATION_CHUNK)
+        n += math.ceil(num_frames / STAGE2_BATCH)
     return n
 
 
@@ -546,7 +530,7 @@ def _run_pass(model, src, hints, hint_mode, meta, profile, s, outs, *, linear_in
     ids = src.frame_ids
     alpha_out, fg_out, prev_out = outs
     baton_path = os.path.join(tmp, "baton.f16")
-    stage2_batch = max(1, int(s["stage2_batch"]))
+    stage2_batch = STAGE2_BATCH
     checker_lin = None
 
     def write_prediction_batches(items):
@@ -576,13 +560,13 @@ def _run_pass(model, src, hints, hint_mode, meta, profile, s, outs, *, linear_in
                 step()
 
     rt._phase1_setup(model, stage1_on_gpu=not low_vram)
-    configure_chunking(model, s, low_vram)
+    configure_chunking(model, low_vram)
     rvm_feats = _rvm_prepass(model, src, meta, max(1, min(chunk, 8)), step)
     foundation_paths = None
     if low_vram:
         foundation_paths = _foundation_prepass(
             model, src, meta, os.path.join(tmp, "foundation"),
-            max(1, int(s["low_vram_foundation_chunk"])), step)
+            LOW_VRAM_FOUNDATION_CHUNK, step)
         model.foundations.cpu()
         model.stage2.cpu()
         model.stage1.cuda()
@@ -670,14 +654,11 @@ def key_clip(model, images, *, hint=None, hint_frame=0, linear_input=False, hint
             meta = build_meta(len(ids), H, W, s)
             chunk, stride, low_vram, estimate = pick_profile(
                 meta["shape_hw"], len(ids), budget_gb, int(s["hann_chunk"]), s["low_vram"])
-            if int(s["hann_stride"]) > 0:
-                stride = int(s["hann_stride"])
-            stride = max(1, min(stride, chunk))
             on_profile(chunk=chunk, stride=stride, low_vram=low_vram,
                        estimate_gb=estimate, budget_gb=budget_gb, shape_hw=meta["shape_hw"],
                        model_hw=meta["model_native_hw"], frames=(ids[0], ids[-1]))
             passes.append((ids, meta, (chunk, stride, low_vram)))
-        on_total(sum(count_steps(len(ids), c, st, lv, s) for ids, _, (c, st, lv) in passes))
+        on_total(sum(count_steps(len(ids), c, st, lv) for ids, _, (c, st, lv) in passes))
 
         def step():
             check_interrupt()
@@ -686,7 +667,7 @@ def key_clip(model, images, *, hint=None, hint_frame=0, linear_input=False, hint
         outs = (torch.empty((T, H, W), dtype=torch.float32),
                 torch.empty((T, H, W, 3), dtype=torch.float32),
                 torch.empty((T, H, W, 3), dtype=torch.float32))
-        tmp = tempfile.mkdtemp(prefix="bat_corridorkey2_", dir=s["temp_dir"] or None)
+        tmp = tempfile.mkdtemp(prefix="bat_corridorkey2_")   # low-VRAM spill; honours TMPDIR
         try:
             for ids, meta, profile in passes:
                 src = FrameSource(images, meta, linear_input, ids)
@@ -695,10 +676,9 @@ def key_clip(model, images, *, hint=None, hint_frame=0, linear_input=False, hint
                           linear_input=linear_input, hint_quality=hint_quality,
                           despill_strength=despill_strength, screen=screen, tmp=tmp, step=step)
         finally:
-            if not s["keep_model_on_gpu"]:
-                model.foundations.cpu()
-                model.stage1.cpu()
-                model.stage2.cpu()
+            model.foundations.cpu()
+            model.stage1.cpu()
+            model.stage2.cpu()
             shutil.rmtree(tmp, ignore_errors=True)
             torch.cuda.empty_cache()
     return outs

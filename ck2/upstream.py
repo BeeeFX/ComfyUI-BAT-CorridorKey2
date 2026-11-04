@@ -114,9 +114,8 @@ def ensure_upstream(allow_download=True):
         return UPSTREAM_DIR
     if not allow_download:
         raise RuntimeError(
-            f"The CorridorKey 2.0 runtime is not installed at {UPSTREAM_DIR} and "
-            f"auto_download is off. Turn auto_download on, or extract "
-            f"{TARBALL_URL} there by hand.")
+            f"The CorridorKey 2.0 runtime is not installed at {UPSTREAM_DIR}. Run the "
+            f"loader once with internet access, or extract {TARBALL_URL} there by hand.")
     parent = os.path.dirname(UPSTREAM_DIR)
     os.makedirs(parent, exist_ok=True)
     staging = tempfile.mkdtemp(prefix=".ck2_fetch_", dir=parent)

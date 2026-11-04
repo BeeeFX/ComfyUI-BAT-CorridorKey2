@@ -19,6 +19,7 @@ nothing is re-hosted.
 import logging
 import os
 import threading
+from pathlib import Path
 
 import folder_paths
 import torch
@@ -63,11 +64,10 @@ def ensure_weights(allow_download=True, root=MODELS_DIR):
         return asset_paths(root)
     if not allow_download:
         raise RuntimeError(
-            f"CorridorKey weights missing in {root}: {', '.join(missing)}. Turn "
-            f"auto_download on, or run upstream's scripts/download_weights.py "
-            f"--package_root {root}")
+            f"CorridorKey weights missing in {root}: {', '.join(missing)}. Run the "
+            f"loader once with internet access, or run upstream's "
+            f"scripts/download_weights.py --package_root {root}")
     dl = upstream.load_script("scripts/download_weights.py")
-    from pathlib import Path
     target = Path(root)
     logger.info("downloading CorridorKey 2.0 weights (~5 GB) into %s", root)
     if any(k in missing for k in ("weights", "foundation_stats")):
