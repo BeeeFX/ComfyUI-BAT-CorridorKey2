@@ -15,7 +15,7 @@ and so on, their official plugin is at [corridorkey.com](https://corridorkey.com
 |---|---|
 | **🦇 CorridorKey 2 Load Model** | Loads the model (1.27B parameters, about 5 GB). It waits in system RAM and only goes to the GPU while keying. |
 | **🦇 CorridorKey 2** | The keyer. Inputs: `images`, an optional `hint` mask and optional `advanced` settings. Outputs: `foreground`, `alpha`, `preview`. |
-| **🦇 CorridorKey 2 Advanced Params** | Optional. Window size, low-VRAM mode, hint carry, temp folder. If you don't connect it, the key node uses the same defaults. |
+| **🦇 CorridorKey 2 Advanced Params** | Optional. Window size, low-VRAM mode, hint carry, internal resolution, a VRAM cap, temp folder. If you don't connect it, the key node uses the same defaults. |
 
 ### 🦇 CorridorKey 2
 
@@ -29,17 +29,38 @@ and so on, their official plugin is at [corridorkey.com](https://corridorkey.com
 - **hint_quality**: how far to trust the hint. 0.95 for an artist matte, 0.75 for a good
   automatic one (for example SeC), 0.5 or less for a loose garbage matte.
 - **despill_strength**: 0 = the model's raw colour, 1 = full despill. Default 0.5.
-- **hint** (MASK, optional, white = subject):
-  - one mask: a first-frame hint, which the model carries through the shot;
-  - one mask per frame: a full hint;
-  - no hint: the model picks the subject itself. That's fine for simple shots but less
-    reliable when there are several possible subjects.
+- **hint** (MASK, optional, white = subject). With no hint the model picks the subject
+  itself, which is fine for simple shots but less reliable when there are several
+  possible subjects.
+- **hint_mode**:
+  - `all frames`: one mask per frame, such as a roto pass or an automatic track (SeC).
+  - `single frame`: one hint on `hint_frame`, which the model carries through the shot.
+    Given a per-frame batch, it takes the mask at `hint_frame`, so you can pick the best
+    frame of an automatic track.
+- **hint_frame** (only shown in `single frame`): 0 = the first frame. Above 0, the clip is
+  keyed backwards and forwards from that frame, so a matte drawn on a clean frame in the
+  middle of the shot guides all of it.
 
 Outputs:
 
 - `foreground`: straight (not premultiplied), despilled colour;
 - `alpha`: the matte, 0 to 1;
 - `preview`: the result over a checkerboard, for viewing.
+
+### Coming from the CorridorKey app
+
+| App | Here |
+|---|---|
+| Input is Linear? | `input_colorspace` |
+| Internal Resolution | `internal_resolution` (Advanced) |
+| Use Time Awareness? / Time Awareness | `window_frames` (Advanced): 1 = off, 0 = auto |
+| GPU Memory Limit | `vram_limit_gb` (Advanced) |
+| Low GPU Memory | `low_vram` (Advanced) |
+| Alpha Hint | the `hint` input |
+| Hint Frames | `hint_mode` |
+| Reference Frame | `hint_frame` |
+| Alpha Hint Strength | `hint_quality` |
+| Internal Hint Strength | `carry_hint_quality` (Advanced) |
 
 ## Requirements
 
@@ -109,6 +130,12 @@ linear-EXR and low-VRAM modes, and the foreground is within 2.4e-7 (float roundi
 Changes from upstream, all deliberate:
 
 - **Blue-screen despill.**
+- **A single hint on any frame** (`hint_frame`). Upstream only hints frame 0; above 0,
+  this pack keys frames k→0 reversed and k→end, both starting from the hint.
+- **Internal resolution.** Upstream's input path supports a model scale, but its output
+  path refuses one. This pack scales the model output back up with Lanczos while it is
+  still asinh-encoded, before the linear decode, so HDR highlights don't ring.
+- **A VRAM cap** for the automatic window sizing.
 - **A hint at a different resolution is resized.** Upstream rejects a first-frame hint of
   the wrong size.
 - **Download blocking stays local.** Upstream sets `HF_HUB_OFFLINE` and

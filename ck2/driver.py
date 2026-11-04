@@ -20,10 +20,18 @@ What differs from upstream, on purpose:
 * The low-VRAM chunk sizes upstream writes onto the model are reset on every
   run, because here the model is cached between runs.
 * Blue-screen despill, mirroring upstream's green formula (``screen="blue"``).
+* ``internal_resolution``: upstream's preprocessing already supports a model scale
+  (Lanczos before padding) but its render path refuses one. Here the model output
+  is Lanczos-upscaled back to the plate size while still asinh-encoded, before the
+  linear decode, so HDR highlights do not ring the way a linear-light resize would.
+* ``vram_limit_gb`` caps the budget the automatic window sizing works from.
+* A single hint can sit on any frame (``hint_frame``): the clip is keyed
+  backwards and forwards from it (``plan_passes``). Upstream only hints frame 0.
 """
 
 import math
 import os
+import shutil
 import tempfile
 
 import numpy as np
@@ -54,7 +62,11 @@ DEFAULTS = {
     "temp_dir": "",                  # "" = ComfyUI temp dir
     "keep_model_on_gpu": False,
     "free_comfy_vram": True,
+    "internal_resolution": "full",   # see SCALES
+    "vram_limit_gb": 0.0,            # 0 = all free VRAM
 }
+
+SCALES = {"full": 1.0, "3/4": 0.75, "1/2": 0.5, "1/4": 0.25}
 
 
 def _mods():
@@ -69,17 +81,20 @@ def _mods():
 def build_meta(num_frames, h, w, settings):
     """The subset of upstream's probe_*_meta dict the model path reads."""
     _, vio, _ = _mods()
-    h_out = vio.ceil_to_multiple(h, SHAPE_QUANTUM)
-    w_out = vio.ceil_to_multiple(w, SHAPE_QUANTUM)
-    pad_l = (w_out - w) // 2
-    pad_t = (h_out - h) // 2
+    scale = SCALES[settings.get("internal_resolution", "full")]
+    h_m, w_m = vio.scaled_hw(h, w, scale)
+    h_out = vio.ceil_to_multiple(h_m, SHAPE_QUANTUM)
+    w_out = vio.ceil_to_multiple(w_m, SHAPE_QUANTUM)
+    pad_l = (w_out - w_m) // 2
+    pad_t = (h_out - h_m) // 2
     return {
         "num_frames": int(num_frames),
         "native_hw": (h, w),
         "output_hw": (h, w),
-        "model_native_hw": (h, w),
+        "model_native_hw": (h_m, w_m),
+        "model_scale": scale,
         "shape_hw": (h_out, w_out),
-        "pad": (pad_l, w_out - w - pad_l, pad_t, h_out - h - pad_t),
+        "pad": (pad_l, w_out - w_m - pad_l, pad_t, h_out - h_m - pad_t),
         "linear_brightness": float(settings["linear_brightness"]),
         "linear_contrast": float(settings["linear_contrast"]),
         "linear_contrast_pivot": float(settings["linear_contrast_pivot"]),
@@ -159,10 +174,11 @@ class FrameSource:
     follows the video path, which is the only one upstream applies it on.
     """
 
-    def __init__(self, images, meta, linear_input):
+    def __init__(self, images, meta, linear_input, frame_ids):
         self.images = images
         self.meta = meta
         self.linear = bool(linear_input)
+        self.frame_ids = frame_ids      # pass-local t -> index into the batch
         self.cache = {}
 
     def _pad(self, arr):
@@ -173,7 +189,7 @@ class FrameSource:
 
     def views(self, t, need_model=True):
         _, vio, cu = _mods()
-        frame = self.images[t, :, :, :3].float().cpu().numpy()
+        frame = self.images[self.frame_ids[t], :, :, :3].float().cpu().numpy()
         frame = np.ascontiguousarray(frame, dtype=np.float32)
         if self.linear:
             linear = frame
@@ -181,6 +197,11 @@ class FrameSource:
         else:
             display = np.clip(frame, 0.0, 1.0)
             linear = cu.srgb_to_linear(display)
+        model_hw = tuple(self.meta["model_native_hw"])
+        if model_hw != display.shape[:2]:
+            # upstream preprocess_frame_dir_path: both views resized separately
+            display = vio.resize_hwc_lanczos(display, model_hw)
+            linear = vio.resize_hwc_lanczos(linear, model_hw)
         review = torch.from_numpy(
             self._pad(np.clip(display, 0.0, 1.0)).transpose(2, 0, 1)).to(torch.bfloat16)
         linear_model = linear
@@ -213,14 +234,17 @@ class FrameSource:
 class HintSource:
     """MASK batch -> padded bf16 hint frames, as upstream's hint readers make them."""
 
-    def __init__(self, masks, meta):
+    def __init__(self, masks, meta, frame_ids):
         self.masks = masks
         self.meta = meta
+        self.frame_ids = frame_ids
 
     def frame(self, t):
         _, vio, _ = _mods()
         import cv2
-        hint = self.masks[t].float().cpu().numpy().astype(np.float32, copy=False)
+        # A single mask is the hint for pass-local frame 0, whichever frame that is.
+        idx = 0 if self.masks.shape[0] == 1 else self.frame_ids[t]
+        hint = self.masks[idx].float().cpu().numpy().astype(np.float32, copy=False)
         h_model, w_model = self.meta["model_native_hw"]
         if hint.shape[:2] != (h_model, w_model):
             hint = cv2.resize(hint, (w_model, h_model), interpolation=cv2.INTER_LANCZOS4)
@@ -252,6 +276,21 @@ def despill(fg, strength, screen):
     return fg * (1.0 - strength) + full * strength
 
 
+def _upscale_to_output(x, meta):
+    """Model-resolution [B,C,h,w] -> plate size, Lanczos (cv2), on the raw model output.
+
+    Runs on alpha + asinh-encoded foreground, so the resize happens in the model's
+    own compressed HDR domain rather than in linear light.
+    """
+    if tuple(meta["model_native_hw"]) == tuple(meta["output_hw"]):
+        return x
+    _, vio, _ = _mods()
+    arr = x.detach().float().cpu().numpy()
+    up = np.stack([vio.resize_chw_lanczos(np.ascontiguousarray(f), tuple(meta["output_hw"]))
+                   for f in arr])
+    return torch.from_numpy(up).to(x.device)
+
+
 def render(logits, meta, *, linear_output, despill_strength, screen, checker_lin):
     """Stage-2 logits -> (alpha, foreground, preview), all float32 on logits' device.
 
@@ -262,9 +301,9 @@ def render(logits, meta, *, linear_output, despill_strength, screen, checker_lin
     upstream's checker composite, always returned sRGB-encoded for viewing.
     """
     rt, _, cu = _mods()
-    alpha = rt._crop_native_torch(logits[:, 0:1].float(), meta).clamp(0.0, 1.0)
-    fg_lin = rt._linear_adjust_inverse_torch(
-        cu.asinh_to_linear(rt._crop_native_torch(logits[:, 1:4].float(), meta)), meta)
+    out = _upscale_to_output(rt._crop_native_torch(logits[:, 0:4].float(), meta), meta)
+    alpha = out[:, 0:1].clamp(0.0, 1.0)
+    fg_lin = rt._linear_adjust_inverse_torch(cu.asinh_to_linear(out[:, 1:4]), meta)
     if linear_output:
         fg = despill(fg_lin, despill_strength, screen)
         comp_lin = fg * alpha + checker_lin * (1.0 - alpha)
@@ -497,15 +536,109 @@ def count_steps(num_frames, chunk, stride, low_vram, settings):
     return n
 
 
-def key_clip(model, images, *, hint=None, linear_input=False, hint_quality=0.95,
+def _run_pass(model, src, hints, hint_mode, meta, profile, s, outs, *, linear_input,
+              hint_quality, despill_strength, screen, tmp, step):
+    """One pass of run_inference over ``src.frame_ids``, writing into ``outs``."""
+    rt, vio, cu = _mods()
+    chunk, stride, low_vram = profile
+    T = meta["num_frames"]
+    H, W = meta["output_hw"]
+    ids = src.frame_ids
+    alpha_out, fg_out, prev_out = outs
+    baton_path = os.path.join(tmp, "baton.f16")
+    stage2_batch = max(1, int(s["stage2_batch"]))
+    checker_lin = None
+
+    def write_prediction_batches(items):
+        nonlocal checker_lin
+        dev = next(model.stage2.parameters()).device
+        if checker_lin is None:
+            checker = torch.from_numpy(vio.make_checker(H, W)).to(dev).unsqueeze(0)
+            checker_lin = cu.srgb_to_linear(checker)
+        for offset in range(0, len(items), stage2_batch):
+            sub = items[offset:offset + stage2_batch]
+            rgb_t = torch.stack([it[2] for it in sub], dim=0).unsqueeze(0).to(dev, non_blocking=True)
+            baton_t = torch.from_numpy(np.stack([it[1] for it in sub], axis=0))
+            baton_t = baton_t.unsqueeze(0).to(dev, non_blocking=True).float()
+            with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
+                logits = model.stage2(rgb_t, baton_t)
+                if isinstance(logits, tuple):
+                    logits = logits[0]
+            a, fg, pv = render(logits[0], meta, linear_output=linear_input,
+                               despill_strength=float(despill_strength), screen=screen,
+                               checker_lin=checker_lin)
+            idx = [ids[it[0]] for it in sub]
+            alpha_out[idx] = a.cpu()
+            fg_out[idx] = fg.cpu()
+            prev_out[idx] = pv.cpu()
+            del logits, baton_t, rgb_t, a, fg, pv
+            if low_vram:
+                step()
+
+    rt._phase1_setup(model, stage1_on_gpu=not low_vram)
+    configure_chunking(model, s, low_vram)
+    rvm_feats = _rvm_prepass(model, src, meta, max(1, min(chunk, 8)), step)
+    foundation_paths = None
+    if low_vram:
+        foundation_paths = _foundation_prepass(
+            model, src, meta, os.path.join(tmp, "foundation"),
+            max(1, int(s["low_vram_foundation_chunk"])), step)
+        model.foundations.cpu()
+        model.stage2.cpu()
+        model.stage1.cuda()
+        torch.cuda.empty_cache()
+    else:
+        model.stage2.cuda()
+        model.stage2.eval()
+        torch.cuda.empty_cache()
+
+    _stage1_stream(
+        model, src, hints, hint_mode, meta, chunk=chunk, stride=stride,
+        hint_quality=hint_quality, carry_hint=bool(s["carry_hint"]),
+        carry_hint_quality=float(s["carry_hint_quality"]), rvm_feats=rvm_feats,
+        foundation_paths=foundation_paths, baton_path=baton_path,
+        on_baton_frames=None if low_vram else write_prediction_batches, tick=step)
+    del rvm_feats
+
+    if low_vram:
+        rt._phase2_setup(model)
+        baton = np.memmap(baton_path, dtype=np.float16, mode="r",
+                          shape=(T, model.stage1.d_16, meta["shape_hw"][0] // 16,
+                                 meta["shape_hw"][1] // 16))
+        try:
+            for t0 in range(0, T, stage2_batch):
+                t1 = min(T, t0 + stage2_batch)
+                model_chunk, _f, _r = src.window(t0, t1)
+                write_prediction_batches([
+                    (t, np.asarray(baton[t]).copy(), model_chunk[t - t0])
+                    for t in range(t0, t1)])
+                del model_chunk, _f, _r
+        finally:
+            del baton
+    src.cache.clear()
+
+
+def plan_passes(num_frames, hint_mode, hint_frame):
+    """Frame orders to key. A single hint on frame k > 0 keys k..0 (reversed), then k..end.
+
+    Both passes start from the hint, so each half carries it outwards from frame k;
+    the forward pass runs last and owns frame k itself.
+    """
+    k = min(max(0, int(hint_frame)), num_frames - 1)
+    if hint_mode != "first" or k == 0:
+        return [list(range(num_frames))]
+    return [list(range(k, -1, -1)), list(range(k, num_frames))]
+
+
+def key_clip(model, images, *, hint=None, hint_frame=0, linear_input=False, hint_quality=0.95,
              despill_strength=0.5, screen="green", settings=None, device=None,
              on_profile=_noop, on_total=_noop, tick=_noop, check_interrupt=_noop):
     """Key an IMAGE batch. Returns (alpha [T,H,W], foreground [T,H,W,3], preview [T,H,W,3]).
 
-    ``hint`` is an optional MASK batch: 1 frame = first-frame hint, T frames =
-    one hint per frame. ``device`` is the CUDA device to run on (default: current).
+    ``hint`` is an optional MASK batch: 1 frame = a single hint, placed on
+    ``hint_frame`` (0-based); T frames = one hint per frame (``hint_frame`` unused).
+    ``device`` is the CUDA device to run on (default: current).
     """
-    rt, vio, cu = _mods()
     s = dict(DEFAULTS)
     s.update(settings or {})
     if images.ndim != 4 or images.shape[-1] < 3:
@@ -523,121 +656,49 @@ def key_clip(model, images, *, hint=None, linear_input=False, hint_quality=0.95,
         else:
             raise ValueError(
                 f"hint has {hint.shape[0]} frames but the clip has {T}. Give one mask "
-                f"(a first-frame hint) or exactly one mask per frame.")
-
-    meta = build_meta(T, H, W, s)
-    src = FrameSource(images, meta, linear_input)
-    hints = HintSource(hint, meta) if hint is not None else None
+                f"(a single hint) or exactly one mask per frame.")
 
     device = torch.device(device) if device is not None else torch.device("cuda", torch.cuda.current_device())
     with torch.cuda.device(device):
         free_b, _ = torch.cuda.mem_get_info()
         budget_gb = (free_b + torch.cuda.memory_reserved()) / 2 ** 30
-        chunk, stride, low_vram, estimate = pick_profile(
-            meta["shape_hw"], T, budget_gb, int(s["hann_chunk"]), s["low_vram"])
-        if int(s["hann_stride"]) > 0:
-            stride = int(s["hann_stride"])
-        stride = max(1, min(stride, chunk))
-        on_profile(chunk=chunk, stride=stride, low_vram=low_vram,
-                   estimate_gb=estimate, budget_gb=budget_gb, shape_hw=meta["shape_hw"])
-        on_total(count_steps(T, chunk, stride, low_vram, s))
+        if float(s["vram_limit_gb"] or 0) > 0:
+            budget_gb = min(budget_gb, float(s["vram_limit_gb"]))
+
+        passes = []
+        for ids in plan_passes(T, hint_mode, hint_frame):
+            meta = build_meta(len(ids), H, W, s)
+            chunk, stride, low_vram, estimate = pick_profile(
+                meta["shape_hw"], len(ids), budget_gb, int(s["hann_chunk"]), s["low_vram"])
+            if int(s["hann_stride"]) > 0:
+                stride = int(s["hann_stride"])
+            stride = max(1, min(stride, chunk))
+            on_profile(chunk=chunk, stride=stride, low_vram=low_vram,
+                       estimate_gb=estimate, budget_gb=budget_gb, shape_hw=meta["shape_hw"],
+                       model_hw=meta["model_native_hw"], frames=(ids[0], ids[-1]))
+            passes.append((ids, meta, (chunk, stride, low_vram)))
+        on_total(sum(count_steps(len(ids), c, st, lv, s) for ids, _, (c, st, lv) in passes))
 
         def step():
             check_interrupt()
             tick()
 
-        alpha_out = torch.empty((T, H, W), dtype=torch.float32)
-        fg_out = torch.empty((T, H, W, 3), dtype=torch.float32)
-        prev_out = torch.empty((T, H, W, 3), dtype=torch.float32)
-
-        temp_root = s["temp_dir"] or None
-        tmp = tempfile.mkdtemp(prefix="bat_corridorkey2_", dir=temp_root)
-        baton_path = os.path.join(tmp, "baton.f16")
-        foundation_prefix = os.path.join(tmp, "foundation")
-        stage2_batch = max(1, int(s["stage2_batch"]))
-        checker_lin = None
-
-        def write_prediction_batches(items):
-            nonlocal checker_lin
-            dev = next(model.stage2.parameters()).device
-            if checker_lin is None:
-                checker = torch.from_numpy(vio.make_checker(H, W)).to(dev).unsqueeze(0)
-                checker_lin = cu.srgb_to_linear(checker)
-            for offset in range(0, len(items), stage2_batch):
-                sub = items[offset:offset + stage2_batch]
-                rgb_t = torch.stack([it[2] for it in sub], dim=0).unsqueeze(0).to(dev, non_blocking=True)
-                baton_t = torch.from_numpy(np.stack([it[1] for it in sub], axis=0))
-                baton_t = baton_t.unsqueeze(0).to(dev, non_blocking=True).float()
-                with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
-                    logits = model.stage2(rgb_t, baton_t)
-                    if isinstance(logits, tuple):
-                        logits = logits[0]
-                a, fg, pv = render(logits[0], meta, linear_output=linear_input,
-                                   despill_strength=float(despill_strength), screen=screen,
-                                   checker_lin=checker_lin)
-                idx = [it[0] for it in sub]
-                alpha_out[idx] = a.cpu()
-                fg_out[idx] = fg.cpu()
-                prev_out[idx] = pv.cpu()
-                del logits, baton_t, rgb_t, a, fg, pv
-                if low_vram:
-                    step()
-
+        outs = (torch.empty((T, H, W), dtype=torch.float32),
+                torch.empty((T, H, W, 3), dtype=torch.float32),
+                torch.empty((T, H, W, 3), dtype=torch.float32))
+        tmp = tempfile.mkdtemp(prefix="bat_corridorkey2_", dir=s["temp_dir"] or None)
         try:
-            rt._phase1_setup(model, stage1_on_gpu=not low_vram)
-            configure_chunking(model, s, low_vram)
-            rvm_feats = _rvm_prepass(model, src, meta, max(1, min(chunk, 8)), step)
-            foundation_paths = None
-            if low_vram:
-                foundation_paths = _foundation_prepass(
-                    model, src, meta, foundation_prefix,
-                    max(1, int(s["low_vram_foundation_chunk"])), step)
-                model.foundations.cpu()
-                model.stage2.cpu()
-                model.stage1.cuda()
-                torch.cuda.empty_cache()
-            else:
-                model.stage2.cuda()
-                model.stage2.eval()
-                torch.cuda.empty_cache()
-
-            _stage1_stream(
-                model, src, hints, hint_mode, meta, chunk=chunk, stride=stride,
-                hint_quality=hint_quality, carry_hint=bool(s["carry_hint"]),
-                carry_hint_quality=float(s["carry_hint_quality"]), rvm_feats=rvm_feats,
-                foundation_paths=foundation_paths, baton_path=baton_path,
-                on_baton_frames=None if low_vram else write_prediction_batches, tick=step)
-            del rvm_feats
-
-            if low_vram:
-                rt._phase2_setup(model)
-                baton = np.memmap(baton_path, dtype=np.float16, mode="r",
-                                  shape=(T, model.stage1.d_16, meta["shape_hw"][0] // 16,
-                                         meta["shape_hw"][1] // 16))
-                try:
-                    for t0 in range(0, T, stage2_batch):
-                        t1 = min(T, t0 + stage2_batch)
-                        model_chunk, _f, _r = src.window(t0, t1)
-                        write_prediction_batches([
-                            (t, np.asarray(baton[t]).copy(), model_chunk[t - t0])
-                            for t in range(t0, t1)])
-                        del model_chunk, _f, _r
-                finally:
-                    del baton
+            for ids, meta, profile in passes:
+                src = FrameSource(images, meta, linear_input, ids)
+                hints = HintSource(hint, meta, ids) if hint is not None else None
+                _run_pass(model, src, hints, hint_mode, meta, profile, s, outs,
+                          linear_input=linear_input, hint_quality=hint_quality,
+                          despill_strength=despill_strength, screen=screen, tmp=tmp, step=step)
         finally:
             if not s["keep_model_on_gpu"]:
                 model.foundations.cpu()
                 model.stage1.cpu()
                 model.stage2.cpu()
-            src.cache.clear()
-            for name in os.listdir(tmp):
-                try:
-                    os.remove(os.path.join(tmp, name))
-                except OSError:
-                    pass
-            try:
-                os.rmdir(tmp)
-            except OSError:
-                pass
+            shutil.rmtree(tmp, ignore_errors=True)
             torch.cuda.empty_cache()
-    return alpha_out, fg_out, prev_out
+    return outs

@@ -28,6 +28,33 @@ ADVANCED_TYPE = "BAT_CORRIDORKEY2_ADVANCED"
 
 COLORSPACES = ["sRGB", "linear"]
 SCREENS = ["green", "blue"]
+HINT_MODES = ["all frames", "single frame"]
+
+
+def select_hint(hint, num_frames, hint_mode, hint_frame):
+    """Resolve the MASK input against hint_mode -> (masks for the driver, hint frame).
+
+    single frame takes a lone mask as the hint for ``hint_frame``, or picks that
+    frame out of a per-frame batch (e.g. an automatic track).
+    """
+    if hint is None:
+        return None, 0
+    if hint.ndim == 2:
+        hint = hint.unsqueeze(0)
+    n = int(hint.shape[0])
+    if hint_mode == "all frames":
+        if n != num_frames:
+            raise ValueError(
+                f"hint_mode is 'all frames' but the hint has {n} mask(s) for {num_frames} "
+                f"frames. Switch hint_mode to 'single frame' to use one mask.")
+        return hint, 0
+    k = min(int(hint_frame), num_frames - 1)
+    if n == 1:
+        return hint, k
+    if n == num_frames:
+        return hint[k:k + 1], k
+    raise ValueError(
+        f"the hint has {n} masks for {num_frames} frames. Give one mask, or one per frame.")
 
 
 class CorridorKey2LoadModel:
@@ -143,6 +170,21 @@ class CorridorKey2AdvancedParams:
                 "linear_contrast_pivot": ("FLOAT", {
                     "default": d["linear_contrast_pivot"], "min": 0.0, "max": 10.0, "step": 0.01,
                     "tooltip": "Experimental (upstream): pivot for linear_contrast."}),
+                # Appended after the original widgets: widgets_values is positional.
+                "internal_resolution": (list(driver.SCALES), {
+                    "default": d["internal_resolution"],
+                    "tooltip": "Key a downscaled copy and scale the result back up to the plate "
+                               "size (Lanczos). Faster and lighter, with softer edges and "
+                               "fine detail (hair). The model was trained at native resolution, "
+                               "so full is the reference quality.",
+                }),
+                "vram_limit_gb": ("FLOAT", {
+                    "default": d["vram_limit_gb"], "min": 0.0, "max": 1024.0, "step": 0.5,
+                    "tooltip": "Cap the VRAM the automatic window sizing plans for, in GB. "
+                               "0 = everything free on the card. Use it on a shared GPU so the "
+                               "key leaves room for other jobs. Never raises the budget above "
+                               "what is actually free.",
+                }),
             }
         }
 
@@ -190,6 +232,21 @@ class CorridorKey2:
                     "tooltip": "Spill removal on the foreground and preview. 0 = the model's "
                                "raw colour, 1 = full average despill.",
                 }),
+                # Appended after the original widgets: widgets_values is positional.
+                "hint_mode": (HINT_MODES, {
+                    "default": "all frames",
+                    "tooltip": "all frames = the hint is one mask per frame (a roto pass or an "
+                               "automatic track). single frame = one hint on hint_frame, which "
+                               "the model carries through the shot; from a per-frame batch it "
+                               "takes the mask at hint_frame.",
+                }),
+                "hint_frame": ("INT", {
+                    "default": 0, "min": 0, "max": 100000,
+                    "tooltip": "The frame the hint belongs to (0 = first frame of the batch). "
+                               "Above 0 the clip is keyed backwards and forwards from it, so a "
+                               "matte on a clean middle frame guides the whole shot. Clamped to "
+                               "the last frame.",
+                }),
             },
             "optional": {
                 "hint": ("MASK", {
@@ -216,10 +273,11 @@ class CorridorKey2:
         "foreground colour for a whole clip, temporally consistent. NVIDIA GPU only.")
 
     def key(self, model, images, input_colorspace, screen, hint_quality, despill_strength,
-            hint=None, advanced=None):
+            hint_mode="all frames", hint_frame=0, hint=None, advanced=None):
         import comfy.model_management as mm
         import comfy.utils
 
+        hint, hint_frame = select_hint(hint, images.shape[0], hint_mode, hint_frame)
         settings = dict(driver.DEFAULTS)
         if advanced:
             settings.update({k: v for k, v in advanced.items() if k in driver.DEFAULTS})
@@ -233,12 +291,12 @@ class CorridorKey2:
 
         state = {}
 
-        def on_profile(chunk, stride, low_vram, estimate_gb, budget_gb, shape_hw):
+        def on_profile(chunk, stride, low_vram, estimate_gb, budget_gb, shape_hw, model_hw, frames):
             logger.info(
-                "keying %d frames at %dx%d (padded %dx%d): window %d/%d, low_vram=%s, "
-                "estimated peak %.1f GB of %.1f GB available",
-                images.shape[0], images.shape[2], images.shape[1], shape_hw[1], shape_hw[0],
-                chunk, stride, low_vram, estimate_gb, budget_gb)
+                "keying frames %d->%d of %dx%d at %dx%d (padded %dx%d): window %d/%d, "
+                "low_vram=%s, estimated peak %.1f GB of %.1f GB budget",
+                frames[0], frames[1], images.shape[2], images.shape[1], model_hw[1], model_hw[0],
+                shape_hw[1], shape_hw[0], chunk, stride, low_vram, estimate_gb, budget_gb)
             if estimate_gb * 1.1 + 0.3 > budget_gb:
                 logger.warning("even this window may not fit the GPU; expect out-of-memory")
 
@@ -249,7 +307,8 @@ class CorridorKey2:
             state["pbar"].update(1)
 
         alpha, fg, preview = driver.key_clip(
-            model, images, hint=hint, linear_input=(input_colorspace == "linear"),
+            model, images, hint=hint, hint_frame=hint_frame,
+            linear_input=(input_colorspace == "linear"),
             hint_quality=hint_quality, despill_strength=despill_strength, screen=screen,
             settings=settings, device=device, on_profile=on_profile, on_total=on_total,
             tick=tick, check_interrupt=mm.throw_exception_if_processing_interrupted)
