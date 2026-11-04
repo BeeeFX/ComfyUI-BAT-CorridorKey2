@@ -1,0 +1,26 @@
+# ComfyUI-BAT-CorridorKey2 dependencies.
+#
+# ComfyUI already provides torch, torchvision, numpy, safetensors, einops,
+# transformers, huggingface_hub, scipy, Pillow and tqdm. None of those are listed
+# here, so pip cannot renegotiate their versions and break another custom node.
+#
+# Do NOT install upstream CorridorKey's own requirements.txt. It pins numpy<2,
+# which would downgrade numpy across the whole ComfyUI environment; the runtime
+# was checked against numpy 2.2 by tests/parity_vs_upstream.py. It also pins
+# utils3d to a git commit that is only needed by MoGe code paths CorridorKey never
+# calls -- MoGe just imports it at module load.
+#
+# Tested with torch 2.9.1 / torchvision 0.24.1 (upstream's own test versions),
+# transformers 4.57, timm 1.0.24, opencv-python 4.11, utils3d 0.0.2 (git 9a4eb15).
+
+# C-RADIOv4's model code (downloaded with its weights) builds on timm.
+timm>=1.0
+
+# Upstream's colour/padding/resize helpers. Skip if any cv2 is already installed:
+# a second, competing OpenCV distribution breaks every pack that uses cv2.
+opencv-python-headless>=4.9
+
+# Imported (not used) by the bundled MoGe at module load. Pinned to the commit
+# this pack was tested with, from the author's GitHub -- the bare PyPI name is
+# not the same distribution. Skip if another pack already installed utils3d.
+utils3d @ git+https://github.com/EasternJournalist/utils3d.git@9a4eb15e4021b67b12c460c7057d642626897ec8

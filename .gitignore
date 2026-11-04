@@ -1,0 +1,5 @@
+# Pinned upstream CorridorKey 2.0 runtime, fetched on first use (ck2/upstream.py).
+# Never commit it: this repository must not redistribute Corridor Digital's code.
+upstream/
+__pycache__/
+*.pyc

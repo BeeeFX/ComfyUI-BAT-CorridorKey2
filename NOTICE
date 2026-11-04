@@ -1,0 +1,36 @@
+ComfyUI-BAT-CorridorKey2
+========================
+
+This repository contains only ComfyUI integration code. Everything below is
+downloaded on first use from its original publisher and is NOT redistributed
+here. Each component stays under its own licence.
+
+
+1. CorridorKey 2.0 (runtime code and model weights)
+   https://github.com/nikopueringer/CorridorKey2.0
+   https://huggingface.co/nikopueringer/CorridorKey2.0
+   Licence: Corridor Key Licence v2.0 (CC BY-NC-SA 4.0 with Additional Terms)
+   Copyright (c) Corridor Digital LLC
+   Pinned commit: see ck2/UPSTREAM_MANIFEST.json
+
+   This pack's ck2/driver.py follows the structure of upstream's
+   corridorkey/runtime.py (run_inference, precompute_rvm_to_memmap,
+   precompute_foundations_to_memmap, hann_stage1_stream) so that it gives the
+   same result from in-memory tensors; it calls upstream's own functions for the
+   model, colour transforms, padding, windowing and despill.
+
+2. C-RADIOv4-SO400M
+   https://huggingface.co/nvidia/C-RADIOv4-SO400M
+   Licence: NVIDIA Open Model License
+   Copyright (c) NVIDIA Corporation
+
+3. MoGe-2 ViT-B (code in upstream third_party/MoGe, weights on Hugging Face)
+   https://github.com/microsoft/MoGe
+   https://huggingface.co/Ruicheng/moge-2-vitb-normal
+   Licence: MIT (code and weights); bundled DINOv2 code under Apache-2.0
+   Copyright (c) Microsoft Corporation; DINOv2 (c) Meta Platforms, Inc.
+
+4. RVM (Recurrent Video MAE), small
+   https://github.com/google-deepmind/representations4d
+   Licence: Apache-2.0 (code), CC-BY-4.0 (weights)
+   Copyright (c) Google DeepMind
