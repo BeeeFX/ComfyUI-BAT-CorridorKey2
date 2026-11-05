@@ -13,8 +13,7 @@ and so on, their official plugin is at [corridorkey.com](https://corridorkey.com
 
 | Node | What it does |
 |---|---|
-| **🦇 CorridorKey 2 Load Model** | Loads the model (1.27B parameters, about 5 GB). It waits in system RAM and only goes to the GPU while keying. |
-| **🦇 CorridorKey 2** | The keyer. Inputs: `images`, an optional `hint` mask and optional `advanced` settings. Outputs: `foreground`, `alpha`, `preview`. |
+| **🦇 CorridorKey 2** | The keyer. Inputs: `images`, an optional `hint` mask and optional `advanced` settings. Outputs: `foreground`, `alpha`, `preview`. It loads the model itself (1.27B parameters, about 5 GB, fetched on first use); the model waits in system RAM between runs and only goes to the GPU while keying. |
 | **🦇 CorridorKey 2 Advanced Params** | Optional. Time awareness (window), low-VRAM mode, a VRAM cap, internal resolution, hint carry. If you don't connect it, the key node uses the same defaults. |
 
 ### 🦇 CorridorKey 2
@@ -54,6 +53,11 @@ Outputs:
 - `foreground`: straight (not premultiplied), despilled colour;
 - `alpha`: the matte, 0 to 1;
 - `preview`: the result over a checkerboard, for viewing.
+
+**Older workflows:** until 2026-11-05 the model came from a separate **🦇 CorridorKey 2 Load
+Model** node. It is still installed, hidden from the node search, and the key node's `model`
+socket is still there (optional, last) — so workflows that use it open and run unchanged. In
+new graphs, leave `model` unconnected; you can delete the old loader and its link.
 
 ### 🦇 CorridorKey 2 Advanced Params
 

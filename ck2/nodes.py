@@ -1,7 +1,13 @@
 """
-The three nodes.
+The nodes.
 
-    🦇 CorridorKey 2 Load Model  ->  🦇 CorridorKey 2  <-  🦇 CorridorKey 2 Advanced Params (optional)
+    🦇 CorridorKey 2  <-  🦇 CorridorKey 2 Advanced Params (optional)
+
+The key node loads the model itself (2026-11-05): there is one model and
+nothing to choose about it, so a loader node was only something to wire. 🦇
+CorridorKey 2 Load Model is still registered, hidden from search, so workflows
+saved with it open and run unchanged — its `model` socket on the key node is
+now optional and, when wired, used exactly as before.
 
 Node IDs and socket types carry a Bat_/BAT_ prefix: other ComfyUI CorridorKey 2
 packs exist, and an unprefixed CORRIDORKEY2_MODEL socket would let their loader
@@ -104,11 +110,10 @@ class CorridorKey2LoadModel:
     RETURN_NAMES = ("model",)
     FUNCTION = "load"
     CATEGORY = CATEGORY
+    DEPRECATED = True        # hidden from search; kept so older workflows still load
     DESCRIPTION = (
-        "Loads CorridorKey 2.0 (1.27B parameters, ~5 GB). On first use it fetches the pinned "
-        "upstream runtime from GitHub and the weights from their publishers into "
-        "models/corridorkey. The model waits in system RAM and only moves to the GPU while a "
-        "CorridorKey 2 node is keying.")
+        "No longer needed: 🦇 CorridorKey 2 loads the model itself. Kept so workflows that "
+        "use it still open and run; you can delete it and its link.")
 
     def load(self):
         return (assets.load_model(),)
@@ -177,7 +182,6 @@ class CorridorKey2:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "model": (MODEL_TYPE, {"tooltip": "From 🦇 CorridorKey 2 Load Model."}),
                 "images": ("IMAGE", {"tooltip": "The green/blue-screen clip, as a frame batch. "
                                                 "Keyed at native resolution."}),
                 "input_colorspace": (COLORSPACES, {
@@ -241,6 +245,10 @@ class CorridorKey2:
                 }),
                 "advanced": (ADVANCED_TYPE, {
                     "tooltip": "Optional 🦇 CorridorKey 2 Advanced Params. Unconnected = defaults."}),
+                # Last, so the hint / advanced sockets keep their places on new nodes.
+                "model": (MODEL_TYPE, {
+                    "tooltip": "Leave unconnected: the node loads the model itself. Only there so "
+                               "workflows built with 🦇 CorridorKey 2 Load Model keep working."}),
             },
         }
 
@@ -257,10 +265,15 @@ class CorridorKey2:
         "Green/blue-screen keying with CorridorKey 2.0 by Corridor Digital: alpha and "
         "foreground colour for a whole clip, temporally consistent. NVIDIA GPU only.")
 
-    def key(self, model, images, input_colorspace, screen, hint_quality, despill_strength,
+    def key(self, images, input_colorspace, screen, hint_quality, despill_strength,
             hint_mode="all frames", hint_frame=0, preview=False, preview_frame=0,
-            hint=None, advanced=None):
+            hint=None, advanced=None, model=None):
         import comfy.model_management as mm
+
+        if model is None:
+            # The same cached instance the old loader node returned: one model,
+            # fetched on first use, waiting in system RAM between runs.
+            model = assets.load_model()
         import comfy.utils
 
         hint, hint_frame = select_hint(hint, images.shape[0], hint_mode, hint_frame)

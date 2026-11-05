@@ -171,6 +171,14 @@ def test_nodes():
           == ["window_frames", "low_vram", "vram_limit_gb", "internal_resolution",
               "carry_hint", "carry_hint_quality"])
     check("loader has no widgets", nodes.CorridorKey2LoadModel.INPUT_TYPES() == {"required": {}})
+    key_spec = nodes.CorridorKey2.INPUT_TYPES()
+    check("key node loads its own model: model is optional, and last",
+          "model" not in key_spec["required"] and list(key_spec["optional"])[-1] == "model")
+    check("only socket the key node needs is images",
+          [k for k, v in key_spec["required"].items() if v[0] in ("IMAGE", "MASK", nodes.MODEL_TYPE)] == ["images"])
+    check("old loader hidden from search but still registered",
+          getattr(nodes.CorridorKey2LoadModel, "DEPRECATED", False)
+          and "Bat_CorridorKey2_LoadModel" in nodes.NODE_CLASS_MAPPINGS)
 
 
 def test_plan_passes():
