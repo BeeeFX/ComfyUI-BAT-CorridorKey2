@@ -202,7 +202,9 @@ class CorridorKey2:
                 "despill_strength": ("FLOAT", {
                     "default": 0.5, "min": 0.0, "max": 1.0, "step": 0.05,
                     "tooltip": "Spill removal on the foreground and preview. 0 = the model's "
-                               "raw colour, 1 = full average despill.",
+                               "raw colour, 1 = full average despill. Changing it here re-keys "
+                               "the whole clip; for instant changes set 0 and use 🦇 Despill "
+                               "(ComfyUI-BAT-NodePack) after this node.",
                 }),
                 # Appended after the original widgets: widgets_values is positional.
                 "hint_mode": (HINT_MODES, {

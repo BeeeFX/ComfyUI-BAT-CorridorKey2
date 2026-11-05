@@ -67,6 +67,24 @@ Outputs:
 
 Low-VRAM mode spills its temporary files to the system temp folder; set `TMPDIR` to move it.
 
+### Despill without re-keying, and why the foreground looks soft
+
+Despill is the last thing the key node does to each frame, but as a widget there,
+changing it re-keys the whole clip. For instant changes set **despill_strength** to 0
+and put **🦇 Despill** from [ComfyUI-BAT-NodePack](https://github.com/BeeeFX/ComfyUI-BAT-NodePack)
+after the key node: only that node re-runs. It outputs the despilled foreground, the
+premultiplied foreground and a comp, and has an on-node viewer (comp / alpha / foreground /
+premultiplied / spill removed / plate, zoom to real pixels, hold B to compare).
+`tests/test_bat_despill_parity.py` checks it gives the same pixels as this pack's despill
+and preview whenever both packs are installed.
+
+The **foreground** output is straight (unpremultiplied) colour, meant to be multiplied by
+alpha. Where alpha is near zero the colour has no effect in a comp, so the model carries the
+subject's colour on past the matte edge (on a test shot, 10–20 px of hair colour where
+alpha < 0.05), and nothing pins it from frame to frame: on its own it looks soft and
+flickers at the edges. Multiplied by alpha — the preview, or 🦇 Despill's premultiplied and
+comp outputs — the edge is crisp. Judge and render from those.
+
 ### Coming from the CorridorKey app
 
 | App | Here |
